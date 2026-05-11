@@ -41,4 +41,16 @@ export const adminApi = {
     client
       .post("/admin/reports/remove", { report_id, ban_user })
       .then((r) => r.data),
+
+  // User Reports
+  listUserReports: (status) =>
+    client
+      .get("/admin/userReports", { params: status ? { status } : {} })
+      .then((r) => r.data),
+
+  updateUserReport: (id, status) =>
+    client.put(`/admin/userReports/${id}`, { status }).then((r) => r.data),
+
+  banReportedUser: (report_id) =>
+    client.post("/admin/userReports/ban", { report_id }).then((r) => r.data),
 };
