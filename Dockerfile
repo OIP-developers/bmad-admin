@@ -24,9 +24,9 @@ WORKDIR /app
 # Install minimal static file server
 RUN npm install -g serve@14
  
-# Create non-root user
-RUN addgroup -g 1002 -S appgroup && \
-    adduser -S appuser -u 1001 -G appgroup
+# Create non-root user (Debian-safe slim image supported)
+RUN groupadd -g 1002 appgroup && \
+    useradd -u 1001 -g appgroup -m appuser
  
 # Copy built files only
 COPY --from=builder /app/dist ./dist
@@ -39,4 +39,4 @@ USER appuser
 EXPOSE 4173
  
 # Serve SPA (single-page app support)
-CMD ["serve", "-s", "dist", "-l", "3000"]
+CMD ["serve", "-s", "dist", "-l", "4173"]
