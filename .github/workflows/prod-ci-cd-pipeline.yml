@@ -1,0 +1,211 @@
+name: CI/CD Pipeline for dashboard.bmadapp.com (Production)
+
+on:
+  push:
+    branches:
+      - production
+
+env:
+  ORG_NAME: ${{ github.repository }}
+  BASE_URL: dashboard.bmadapp.com
+
+# ======================================================
+# STAGE 1: BUILD
+# ======================================================
+jobs:
+  build:
+    name: Build
+    runs-on: [self-hosted, prod]
+
+    outputs:
+      image-tag: ${{ steps.set-tag.outputs.image-tag }}
+
+    steps:
+
+      # --------------------------
+      # Checkout Repository
+      # --------------------------
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      # --------------------------
+      # Set Image Tag (prod-<sha>)
+      # --------------------------
+      - name: Set image tag (prod)
+        id: set-tag
+        run: |
+          set -euo pipefail
+
+          SHORT_SHA=$(git rev-parse --short HEAD)
+
+          if [ "${GITHUB_REF##*/}" = "production" ]; then
+            BRANCH_NAME="prod"
+          else
+            echo "ERROR: Invalid branch"
+            exit 1
+          fi
+
+          IMAGE_TAG="${BRANCH_NAME}-${SHORT_SHA}"
+
+          echo "image-tag=$IMAGE_TAG" >> $GITHUB_OUTPUT
+
+          echo "======================================="
+          echo "Image Tag: $IMAGE_TAG"
+          echo "======================================="
+
+      # --------------------------
+      # Verify Docker
+      # --------------------------
+      - name: Verify Docker
+        run: |
+          set -euo pipefail
+          docker info >/dev/null 2>&1 || {
+            echo "ERROR: Docker daemon not running"
+            exit 1
+          }
+
+          echo "Docker is healthy"
+
+      # --------------------------
+      # Create Build .env
+      # --------------------------
+      - name: Create .env (build-time)
+        env:
+          ENV_FILE: ${{ secrets.ENV_PROD }}
+        run: |
+          set -euo pipefail
+          printf "%s" "$ENV_FILE" > .env
+
+          if [ ! -s .env ]; then
+            echo "ERROR: .env is empty"
+            exit 1
+          fi
+
+      # --------------------------
+      # Build Docker Image
+      # --------------------------
+      - name: Build Docker image
+        run: |
+          set -euo pipefail
+
+          IMAGE_TAG="${{ steps.set-tag.outputs.image-tag }}"
+          FULL_IMAGE_NAME="${ORG_NAME}:${IMAGE_TAG}"
+
+          echo "Building: $FULL_IMAGE_NAME"
+
+          docker build \
+            --progress=plain \
+            -t $FULL_IMAGE_NAME \
+            -f Dockerfile .
+
+      # --------------------------
+      # Cleanup
+      # --------------------------
+      - name: Cleanup .env
+        if: always()
+        run: rm -f .env
+
+
+# ======================================================
+# STAGE 2: DEPLOY
+# ======================================================
+  deploy:
+    name: Deploy to Production
+    runs-on: [self-hosted, prod]
+    needs: build
+
+    steps:
+
+      # --------------------------
+      # Create Runtime .env
+      # --------------------------
+      - name: Create deployment .env
+        env:
+          ENV_FILE: ${{ secrets.ENV_PROD }}
+        run: |
+          set -euo pipefail
+          printf "%s" "$ENV_FILE" > .env
+
+          if [ ! -s .env ]; then
+            echo "ERROR: Deployment .env is empty"
+            exit 1
+          fi
+
+      # --------------------------
+      # Deploy Container
+      # --------------------------
+      - name: Deploy Docker Container
+        run: |
+          set -euo pipefail
+
+          IMAGE_TAG="${{ needs.build.outputs.image-tag }}"
+          FULL_IMAGE_NAME="${ORG_NAME}:${IMAGE_TAG}"
+
+          REPO_NAME=$(basename $ORG_NAME)
+          CONTAINER_NAME="${REPO_NAME}-prod"
+          APP_PORT=4175
+
+          echo "======================================="
+          echo "Deploying Production Container"
+          echo "Image     : $FULL_IMAGE_NAME"
+          echo "Container : $CONTAINER_NAME"
+          echo "Port      : $APP_PORT"
+          echo "======================================="
+
+          docker image inspect $FULL_IMAGE_NAME >/dev/null 2>&1 || {
+            echo "ERROR: Image not found"
+            exit 1
+          }
+
+          docker stop $CONTAINER_NAME 2>/dev/null || true
+          docker rm $CONTAINER_NAME 2>/dev/null || true
+
+          docker run -d \
+            --name $CONTAINER_NAME \
+            --env-file .env \
+            -p $APP_PORT:4173 \
+            --restart unless-stopped \
+            $FULL_IMAGE_NAME
+
+      # --------------------------
+      # Health Check
+      # --------------------------
+      - name: Health Check
+        run: |
+          set -euo pipefail
+
+          ATTEMPTS=10
+          SLEEP=3
+
+          for i in $(seq 1 $ATTEMPTS); do
+            if curl -fs http://localhost:$APP_PORT/health >/dev/null; then
+              echo "Health check passed"
+              exit 0
+            fi
+
+            echo "Attempt $i failed..."
+            sleep $SLEEP
+          done
+
+          echo "ERROR: Health check failed"
+          docker logs $CONTAINER_NAME || true
+          exit 1
+
+      # --------------------------
+      # Cleanup
+      # --------------------------
+      - name: Cleanup
+        if: always()
+        run: |
+          rm -f .env
+          docker image prune -f || true
+
+      # --------------------------
+      # Success Message
+      # --------------------------
+      - name: Success
+        run: |
+          echo "======================================="
+          echo "✅ Deployment Successful"
+          echo "URL: https://${BASE_URL}"
+          echo "======================================="
