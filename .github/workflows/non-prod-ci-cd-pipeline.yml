@@ -1,0 +1,187 @@
+name: CI/CD Pipeline for bmadapp (Production)
+
+on:
+  push:
+    branches:
+      - main
+
+env:
+  ORG_NAME: ${{ github.repository }}
+  BASE_URL: bmadapp.com
+
+jobs:
+  build:
+    runs-on: [self-hosted, prod]
+
+    outputs:
+      image-tag: ${{ steps.set-tag.outputs.image-tag }}
+
+    steps:
+      # --------------------------
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      # --------------------------
+      - name: Set short SHA tag (prod)
+        id: set-tag
+        run: |
+          set -euo pipefail
+          SHORT_SHA=$(git rev-parse --short HEAD)
+
+          # Force branch name to 'prod' for main
+          if [ "${GITHUB_REF##*/}" = "main" ]; then
+            BRANCH_NAME="prod"
+          else
+            echo "Unexpected branch. Exiting."
+            exit 1
+          fi
+
+          IMAGE_TAG="${BRANCH_NAME}-${SHORT_SHA}"
+          echo "image-tag=$IMAGE_TAG" >> $GITHUB_OUTPUT
+          echo "Set image tag: $IMAGE_TAG"
+
+      # --------------------------
+      - name: Verify Docker
+        run: |
+          set -euo pipefail
+          if ! command -v docker &>/dev/null; then
+            echo "Docker not installed"
+            exit 1
+          fi
+          if ! docker info &>/dev/null; then
+            echo "Docker daemon not running"
+            exit 1
+          fi
+
+      # --------------------------
+      - name: Create .env file from GitHub secret (PROD)
+        run: |
+          set -euo pipefail
+
+          BRANCH_NAME=${GITHUB_REF##*/}
+
+          if [ "$BRANCH_NAME" = "main" ]; then
+            if [ -z "${{ secrets.ENV_PROD }}" ]; then
+              echo "ERROR: ENV_PROD is not set"
+              exit 1
+            fi
+
+            echo "Creating production .env file..."
+            echo "${{ secrets.ENV_PROD }}" > .env.build
+
+            # Validate file is created and not empty
+            if [ ! -s .env.build ]; then
+              echo "ERROR: .env.build file is empty"
+              exit 1
+            fi
+          else
+            echo "ERROR: Unsupported branch for production"
+            exit 1
+          fi
+
+      # --------------------------
+      - name: Build Docker image
+        run: |
+          set -euo pipefail
+
+          IMAGE_TAG="${{ steps.set-tag.outputs.image-tag }}"
+
+          # IMPORTANT FIX: lowercase repo name for Docker
+          ORG_NAME_LOWER=$(echo "${ORG_NAME}" | tr '[:upper:]' '[:lower:]')
+
+          FULL_IMAGE_NAME="${ORG_NAME_LOWER}:${IMAGE_TAG}"
+
+          echo "Building Docker image $FULL_IMAGE_NAME"
+          docker build --progress=plain -f Dockerfile -t "$FULL_IMAGE_NAME" .
+
+      # --------------------------
+      - name: Clean up .env
+        if: always()
+        run: |
+          echo "Removing temporary .env file..."
+          rm -f .env.build
+
+
+  deploy:
+    runs-on: [self-hosted, prod]
+    needs: build
+
+    steps:
+      - name: Deploy Docker image (PROD)
+        run: |
+          set -euo pipefail
+
+          BRANCH_NAME=${GITHUB_REF##*/}
+          IMAGE_TAG="${{ needs.build.outputs.image-tag }}"
+
+          # IMPORTANT FIX: lowercase repo name for Docker
+          ORG_NAME_LOWER=$(echo "${ORG_NAME}" | tr '[:upper:]' '[:lower:]')
+
+          FULL_IMAGE_NAME="${ORG_NAME_LOWER}:${IMAGE_TAG}"
+          REPO_NAME=$(basename "$ORG_NAME")
+
+          # Force production naming
+          if [ "$BRANCH_NAME" = "main" ]; then
+            ENV_NAME="prod"
+            APP_PORT=4173
+          else
+            echo "ERROR: Invalid branch for production deploy"
+            exit 1
+          fi
+
+          CONTAINER_NAME="${REPO_NAME}-${ENV_NAME}"
+
+          echo "Deploying container:"
+          echo "Environment: $ENV_NAME"
+          echo "Container: $CONTAINER_NAME"
+          echo "Image: $FULL_IMAGE_NAME"
+          echo "Port: $APP_PORT"
+
+          # Stop & remove existing container
+          EXISTING_RUNNING=$(docker ps -q -f name=$CONTAINER_NAME || true)
+          EXISTING_STOPPED=$(docker ps -aq -f name=$CONTAINER_NAME || true)
+          
+          if [ -n "$EXISTING_RUNNING" ]; then
+            echo "Container is running. Stopping and removing..."
+            docker stop $CONTAINER_NAME || { echo "Failed to stop container"; exit 1; }
+            docker rm $CONTAINER_NAME || { echo "Failed to remove container"; exit 1; }
+          elif [ -n "$EXISTING_STOPPED" ]; then
+            echo "Container exists but is stopped. Removing..."
+            docker rm $CONTAINER_NAME || { echo "Failed to remove container"; exit 1; }
+          else
+            echo "No existing container found."
+          fi
+
+          # Run new container
+          echo "Starting new container..."
+          docker run -d \
+            --name $CONTAINER_NAME \
+            -p $APP_PORT:4173 \
+            --restart unless-stopped \
+            $FULL_IMAGE_NAME
+
+          # Health check
+          echo "Waiting for container to become healthy..."
+
+          ATTEMPTS=10
+          SLEEP_TIME=3
+
+          for i in $(seq 1 $ATTEMPTS); do
+            if curl -fs http://localhost:$APP_PORT >/dev/null; then
+              echo "Container is healthy"
+              break
+            fi
+
+            echo "Attempt $i/$ATTEMPTS failed. Retrying in ${SLEEP_TIME}s..."
+            sleep $SLEEP_TIME
+
+            if [ "$i" -eq "$ATTEMPTS" ]; then
+              echo "ERROR: Container failed to respond on port $APP_PORT"
+              echo "Showing logs:"
+              docker logs $CONTAINER_NAME
+              exit 1
+            fi
+          done
+
+          SUCCESS_URL="https://${BASE_URL}"
+          echo "✅ Production deployment successful! Access at $SUCCESS_URL"
