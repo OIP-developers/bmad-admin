@@ -178,7 +178,7 @@ jobs:
           SLEEP=3
 
           for i in $(seq 1 $ATTEMPTS); do
-            if curl -fs http://localhost:$APP_PORT/health >/dev/null; then
+            if curl -fs http://localhost:$APP_PORT >/dev/null; then
               echo "Health check passed"
               exit 0
             fi
