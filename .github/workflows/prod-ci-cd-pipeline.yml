@@ -8,6 +8,7 @@ on:
 env:
   ORG_NAME: ${{ github.repository }}
   BASE_URL: dashboard.bmadapp.com
+  APP_PORT: 4175
 
 # ======================================================
 # STAGE 1: BUILD
