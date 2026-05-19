@@ -141,7 +141,6 @@ jobs:
 
           REPO_NAME=$(basename $ORG_NAME) # Extract repo name from ORG_NAME: e.g., "user/repo" -> "repo"
           CONTAINER_NAME="${REPO_NAME}-prod" # Use repo name for container with -prod suffix
-          APP_PORT=${{ secrets.APP_PORT }} # Use the production port
           
           # Log deployment details
           echo "======================================="
