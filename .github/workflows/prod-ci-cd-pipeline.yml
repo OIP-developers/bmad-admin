@@ -1,0 +1,262 @@
+name: CI/CD Pipeline for dashboard.bmadapp.com (Production)
+
+on:
+  push:
+    branches:
+      - main
+
+env:
+  ORG_NAME: ${{ github.repository }}
+  BASE_URL: dashboard.bmadapp.com
+  APP_PORT: 4175
+
+# ======================================================
+# STAGE 1: BUILD
+# ======================================================
+jobs:
+  build:
+    name: Build
+    runs-on: [self-hosted, prod]
+
+    outputs:
+      image-tag: ${{ steps.set-tag.outputs.image-tag }}
+
+    steps:
+
+      # --------------------------
+      # Checkout Repository
+      # --------------------------
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      # --------------------------
+      # Set Image Tag (prod-<sha>)
+      # --------------------------
+      - name: Set image tag (prod)
+        id: set-tag
+        run: |
+          set -euo pipefail
+          SHORT_SHA=$(git rev-parse --short HEAD)
+
+          # Force branch name to 'prod' for main
+          if [ "${GITHUB_REF##*/}" = "main" ]; then
+            BRANCH_NAME="prod"
+          else
+            echo "Unexpected branch. Exiting."
+            exit 1
+          fi
+
+          IMAGE_TAG="${BRANCH_NAME}-${SHORT_SHA}"
+          echo "image-tag=$IMAGE_TAG" >> $GITHUB_OUTPUT
+          echo "Set image tag: $IMAGE_TAG"
+
+      # --------------------------
+      # Verify Docker
+      # --------------------------
+      - name: Verify Docker
+        run: |
+          set -euo pipefail
+          docker info >/dev/null 2>&1 || {
+            echo "ERROR: Docker daemon not running"
+            exit 1
+          }
+
+          echo "Docker is healthy"
+
+      # --------------------------
+      # Create Build .env
+      # --------------------------
+      - name: Create .env (build-time)
+        env:
+          ENV_FILE: ${{ secrets.ENV_PROD }}
+        run: |
+          set -euo pipefail
+          printf "%s" "$ENV_FILE" > .env
+
+          if [ ! -s .env ]; then
+            echo "ERROR: .env is empty"
+            exit 1
+          fi
+
+      # --------------------------
+      # Build Docker Image
+      # --------------------------
+      - name: Build Docker image
+        run: |
+          set -euo pipefail
+
+          IMAGE_TAG="${{ steps.set-tag.outputs.image-tag }}"
+          FULL_IMAGE_NAME="${ORG_NAME}:${IMAGE_TAG}"
+
+          echo "Building: $FULL_IMAGE_NAME"
+
+          docker build \
+            --progress=plain \
+            -t $FULL_IMAGE_NAME \
+            -f Dockerfile \
+            -t "$FULL_IMAGE_NAME" .
+
+      # --------------------------
+      # Cleanup
+      # --------------------------
+      - name: Cleanup .env
+        if: always()
+        run: rm -f .env
+
+
+# ======================================================
+# STAGE 2: DEPLOY
+# ======================================================
+  deploy:
+    name: Deploy to Production
+    runs-on: [self-hosted, prod]
+    needs: build
+
+    steps:
+
+      # --------------------------
+      # Create Runtime .env
+      # --------------------------
+      - name: Create deployment .env
+        env:
+          ENV_FILE: ${{ secrets.ENV_PROD }}
+        run: |
+          set -euo pipefail
+          printf "%s" "$ENV_FILE" > .env
+
+          if [ ! -s .env ]; then
+            echo "ERROR: Deployment .env is empty"
+            exit 1
+          fi
+
+      # --------------------------
+      # Deploy Container
+      # --------------------------
+      - name: Deploy Docker Container (PROD)
+        run: |
+          set -euo pipefail
+
+          IMAGE_TAG="${{ needs.build.outputs.image-tag }}"
+          FULL_IMAGE_NAME="${ORG_NAME}:${IMAGE_TAG}"
+
+          REPO_NAME=$(basename $ORG_NAME) # Extract repo name from ORG_NAME: e.g., "user/repo" -> "repo"
+          CONTAINER_NAME="${REPO_NAME}-prod" # Use repo name for container with -prod suffix
+          APP_PORT=${{ secrets.APP_PORT }} # Use the production port
+          
+          # Log deployment details
+          echo "======================================="
+          echo "Deploying Production Container:"
+          echo "Image     : $FULL_IMAGE_NAME"
+          echo "Container : $CONTAINER_NAME"
+          echo "Port      : $APP_PORT"
+          echo "======================================="
+
+          # Verify image exists before deploying
+          docker image inspect $FULL_IMAGE_NAME >/dev/null 2>&1 || {
+            echo "ERROR: Image not found"
+            exit 1
+          }
+
+          # Check for existing container
+          EXISTING_RUNNING=$(docker ps -q -f "name=^${CONTAINER_NAME}$")
+          EXISTING_STOPPED=$(docker ps -aq -f "name=^${CONTAINER_NAME}$")
+
+          if [ -n "$EXISTING_RUNNING" ]; then
+            echo "Container is running. Stopping and removing..."
+
+            docker stop "$CONTAINER_NAME" || {
+              echo "Failed to stop container"
+              exit 1
+            }
+
+            docker rm "$CONTAINER_NAME" || {
+              echo "Failed to remove container"
+              exit 1
+            }
+
+          elif [ -n "$EXISTING_STOPPED" ]; then
+            echo "Container exists but is stopped. Removing..."
+
+            docker rm "$CONTAINER_NAME" || {
+              echo "Failed to remove container"
+              exit 1
+            }
+
+          else
+            echo "No existing container found."
+          fi
+
+          # Run new container
+          echo "Starting new container..."
+
+          docker run -d \
+            --name "$CONTAINER_NAME" \
+            --env-file .env \
+            -p "$APP_PORT:4173" \
+            --restart unless-stopped \
+            "$FULL_IMAGE_NAME" || {
+              echo "ERROR: Failed to start container"
+              exit 1
+            }
+
+          sleep 2
+
+          if ! docker ps --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}$"; then
+            echo "ERROR: Container exited unexpectedly"
+
+            docker logs "$CONTAINER_NAME" || true
+            exit 1
+          fi
+
+
+      # --------------------------
+      # Health Check
+      # --------------------------
+      - name: Health Check
+        run: |
+          set -euo pipefail
+
+          echo "Waiting for container to become healthy..."
+
+          END=$((SECONDS + 30))   # total timeout (30s)
+
+          while [ $SECONDS -lt $END ]; do
+            if curl --fail --silent --show-error \
+              "http://localhost:$APP_PORT" >/dev/null; then
+
+              echo "Container is healthy"
+              exit 0
+            fi
+
+            echo "Waiting for health check..."
+            sleep 3
+          done
+
+          echo "ERROR: Container failed health check"
+
+          echo "===== CONTAINER LOGS ====="
+          docker logs "$CONTAINER_NAME" || true
+
+          echo "===== DOCKER PS ====="
+          docker ps -a || true
+
+          exit 1
+
+      # --------------------------
+      # Cleanup
+      # --------------------------
+      - name: Cleanup
+        if: always()
+        run: |
+          rm -f .env
+          docker image prune -f || true
+
+      # --------------------------
+      # Success Message
+      # --------------------------
+      - name: Success
+        run: |
+          echo "======================================="
+          echo "✅ Deployment Successful"
+          echo "URL: https://${BASE_URL}"
+          echo "======================================="

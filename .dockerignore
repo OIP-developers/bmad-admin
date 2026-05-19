@@ -1,0 +1,15 @@
+README.md
+build
+dist
+node_modules
+LICENSE
+# package-lock.json
+.git
+.DS_Store
+# .env
+node_modules/
+npm-debug.log
+*.log
+.env.* # Exclude all .env.* files (if you don't want to include them)
+!.env # Include .env file if it exists
+!.env.production # Include .env.production file if it exists
